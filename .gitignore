@@ -184,5 +184,4 @@ cached_question_*
 */models*/
 /.elasticbeanstalk/
 
-*.docx
 /lda_topics_visualisations/
