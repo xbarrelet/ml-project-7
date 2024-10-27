@@ -1,33 +1,180 @@
+import glob
 import os
 import shutil
 import time
+from random import randint
 
 import keras
-from keras import layers, Sequential, Input
-from keras import ops
-from keras.src.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from keras.src.optimizers import Adam, AdamW
+import numpy as np
+import tensorflow as tf
+from PIL import Image
+from keras import layers, Sequential
+from keras.src.callbacks import EarlyStopping, ReduceLROnPlateau
+from keras.src.optimizers import Adam
 from keras.src.utils import image_dataset_from_directory
 from matplotlib import pyplot as plt
 from pandas import DataFrame
 from plot_keras_history import plot_history
-import tensorflow as tf
+from skimage.filters import gaussian
+from skimage.transform import resize
+from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
+
 
 CROPPED_IMAGES_PATH = "resources/Cropped_Images"
-MODELS_PATH = "models/custom_model_vit"
-RESULTS_PATH = "results/custom_model_vit"
+MODELS_PATH = "models/custom_models"
+RESULTS_PATH = "results/custom_models"
 
-# To optimize GPU memory consumption
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 data_augmentation_layers = keras.Sequential(
     [
-        layers.RandomFlip("horizontal"),
-        layers.RandomRotation(factor=0.02),
-        # layers.RandomZoom(height_factor=0.2, width_factor=0.2),
+        layers.RandomRotation(factor=0.15),
+        layers.RandomTranslation(height_factor=0.1, width_factor=0.1),
+        layers.RandomFlip(mode='horizontal'),
+        layers.RandomContrast(factor=0.1),
+        layers.RandomZoom(height_factor=(-0.2, 0.2), width_factor=(-0.2, 0.2)),
+        layers.RandomBrightness(factor=0.1)
     ],
     name="data_augmentation",
 )
+
+
+class RISE:
+    """
+    Generate heatmap explanations for image classifiers using the RISE methodology by Petsiuk et al.
+    (reference: https://arxiv.org/abs/1806.07421)
+    Generate N binary masks of initial size s by s, which are then upsampled and applied to an image.
+    Elements in the initial arrays are set to 1 with probability p1. Else, they are set to 0.
+    The final heatmap is generated as a linear combination of the masks.
+    The weights are obtained from the softmax probabilities predicted by the base model on the masked images
+    """
+
+    def __init__(self):
+
+        self.model = None
+        self.input_size = None
+        self.masks = None
+
+    def generate_masks(self, N, s, p1):
+
+        """
+        Generate a distribution of random binary masks.
+
+        Args:
+            N: Number of masks.
+            s: Size of mask before upsampling.
+            p1: Probability of setting element value to 1 in the initial mask.
+            verbose: Verbose level for the model prediction step.
+            batch_size: Batch size for predictions.
+
+        Returns:
+            masks: The distribution of upsampled masks.
+        """
+
+        cell_size = np.ceil(np.array(self.input_size) / s)
+        up_size = (s + 1) * cell_size
+
+        grid = np.random.rand(N, s, s) < p1
+        grid = grid.astype('float32')
+
+        masks = np.empty((N, *self.input_size))
+
+        for i in range(N):
+            # Random shifts
+            x = np.random.randint(0, cell_size[0])
+            y = np.random.randint(0, cell_size[1])
+            # Linear upsampling and cropping
+            masks[i, :, :] = resize(grid[i], up_size, order=1, mode='reflect',
+                                    anti_aliasing=False)[x:x + self.input_size[0], y:y + self.input_size[1]]
+        masks = masks.reshape(-1, *self.input_size, 1)
+        return masks
+
+    def explain(
+            self,
+            inp,
+            model,
+            preprocessing_fn=None,
+            masks_user=None,
+            N=2000,
+            s=8,
+            p1=0.5,
+            verbose=0,
+            batch_size=100,
+            mode=None
+    ):
+        """
+        Generate the explanation heatmaps for all classes.
+
+        Args:
+            model: The image classifier. Typically expects a Tensorflow 2.0/Keras model or equivalent class.
+            inp: The image to be explained. Expected to be in the shape used by the model, without any color
+            normalization or futher preprocessing applied. Ideally the any color preprocessing is included
+            within the model class/function.
+            preprocessing_fn: Not implemented yet. For now preprocessing should ideally be included within the model.
+            masks_user: This function calls another function to generate a mask distribution. However a user generated
+            distribution of masks can be passed with this argument.
+            N: Number of masks.
+            s: Size of mask before upsampling.
+            p1: Probability of setting element value to 1 in the initial mask.
+            verbose: Verbose level for the model prediction step.
+            batch_size: Batch size for predictions.
+            mode (experimental): Alternative perturbation modes instead of the simple black gradation mask. 'blur'
+            is a Gaussian blur, 'noise' is colored noise and 'noise_bw' is black and white noise. If None will return
+            the regular black gradation perturbations. Default is None.
+
+        Returns:
+            sal: Explanation heatmaps for all classes. For a given class_id, the heatmap can be access
+            with sal[class_id].
+            masks: The distribution of masks used for generating the set of heatmaps.
+        """
+        self.model = model
+        self.input_size = model.input_shape[1:3]
+
+        if masks_user == None:
+            self.masks = self.generate_masks(N, s, p1)
+        else:
+            self.masks = masks_user  # In case the user wants to pass some custom numpy array of masks.
+
+        # Make sure multiplication is being done for correct axes
+
+        image = inp
+        fudged_image = image.copy()
+
+        if mode == 'blur':  # Gaussian blur
+            fudged_image = gaussian(fudged_image, sigma=4, multichannel=True, preserve_range=True)
+
+        elif mode == 'noise':  # Colored noise
+            fudged_image = np.random.normal(255 / 2, 255 / 9, size=fudged_image.shape).astype('int')
+
+        elif mode == 'noise_bw':  # Grayscale noise
+            fudged_image = np.random.normal(255 / 2, 255 / 5, size=(fudged_image.shape[:2])).astype('int')
+            fudged_image = np.stack((fudged_image,) * 3, axis=-1)
+
+        else:
+            fudged_image = np.zeros(image.shape)  # Regular perturbation with a black gradation
+
+        preds = []
+
+        # Doing these matrix multiplications between the masks and the image can quickly eat up memory.
+        # So we multiply the image with one batch of masks at a time and later append the predictions.
+
+        if (verbose):
+            print('Using batch size: ', batch_size, flush=True)
+
+        for i in (tqdm(range(0, N, batch_size)) if verbose else range(0, N, batch_size)):
+            masks_batch = self.masks[i:min(i + batch_size, N)]
+            masked = image * masks_batch + fudged_image * (1 - masks_batch)
+
+            to_append = model.predict(masked)
+
+            preds.append(to_append)
+
+        preds = np.vstack(preds)
+
+        sal = preds.T.dot(self.masks.reshape(N, -1)).reshape(-1, *self.input_size)
+        sal = sal / N / p1
+
+        return sal, self.masks
 
 
 def remove_last_generated_models_and_results():
@@ -54,28 +201,40 @@ def get_dataset(path, image_size, batch_size, validation_split=0.0, data_type=No
 
 def create_cnn_model(input_shape, labels_number, dropout_rate=0.2, learning_rate=0.001):
     model = Sequential([
-        Input(shape=input_shape),
+        keras.Input(shape=input_shape),
 
         data_augmentation_layers,
 
-        # CNN layers
-        layers.Conv2D(32, 3, padding='same'),
+        layers.Conv2D(64, 3, padding='same', activation='relu'),
         layers.BatchNormalization(),
-        layers.Activation('relu'),
+        layers.Conv2D(64, 3, padding='same', activation='relu'),
+        layers.BatchNormalization(),
         layers.MaxPooling2D((2, 2)),
+        layers.Dropout(dropout_rate),
 
-        layers.Conv2D(64, 3, padding='same'),
+        layers.Conv2D(128, 3, padding='same', activation='relu'),
         layers.BatchNormalization(),
-        layers.Activation('relu'),
+        layers.Conv2D(128, 3, padding='same', activation='relu'),
+        layers.BatchNormalization(),
         layers.MaxPooling2D((2, 2)),
+        layers.Dropout(dropout_rate),
 
-        layers.Conv2D(128, 3, padding='same'),
+        layers.Conv2D(256, 3, padding='same', activation='relu'),
         layers.BatchNormalization(),
-        layers.Activation('relu'),
+        layers.Conv2D(256, 3, padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+        layers.Dropout(dropout_rate),
 
-        # END LAYERS
+        layers.Conv2D(512, 3, padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.Conv2D(512, 3, padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+        layers.Dropout(dropout_rate),
 
         layers.GlobalAveragePooling2D(),
+        layers.Dense(512, activation='relu'),
         layers.Dropout(dropout_rate),
         layers.Dense(labels_number, activation='softmax')
     ])
@@ -85,125 +244,10 @@ def create_cnn_model(input_shape, labels_number, dropout_rate=0.2, learning_rate
     return model
 
 
-class Patches(layers.Layer):
-    def __init__(self, patch_size):
-        super().__init__()
-        self.patch_size = patch_size
-
-    def call(self, images):
-        input_shape = ops.shape(images)
-        batch_size = input_shape[0]
-        height = input_shape[1]
-        width = input_shape[2]
-        channels = input_shape[3]
-        num_patches_h = height // self.patch_size
-        num_patches_w = width // self.patch_size
-        patches = keras.ops.image.extract_patches(images, size=self.patch_size)
-        patches = ops.reshape(
-            patches,
-            (
-                batch_size,
-                num_patches_h * num_patches_w,
-                self.patch_size * self.patch_size * channels,
-            ),
-        )
-        return patches
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"patch_size": self.patch_size})
-        return config
-
-
-# The PatchEncoder layer will linearly transform a patch by projecting it into a vector of size projection_dim.
-# In addition, it adds a learnable position embedding to the projected vector.
-class PatchEncoder(layers.Layer):
-    def __init__(self, num_patches, projection_dim):
-        super().__init__()
-        self.num_patches = num_patches
-        self.projection = layers.Dense(units=projection_dim)
-        self.position_embedding = layers.Embedding(
-            input_dim=num_patches, output_dim=projection_dim
-        )
-
-    def call(self, patch):
-        positions = ops.expand_dims(
-            ops.arange(start=0, stop=self.num_patches, step=1), axis=0
-        )
-        projected_patches = self.projection(patch)
-        encoded = projected_patches + self.position_embedding(positions)
-        return encoded
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"num_patches": self.num_patches})
-        return config
-
-
-def create_vit_model(input_shape, num_classes, image_size=224, patch_size=16, projection_dim=64, num_heads=4,
-                     transformer_layers=8, mlp_first_head_units=2048, learning_rate=0.001, weight_decay=0.0001):
-    num_patches = (image_size // patch_size) ** 2
-    # Size of the transformer layers
-    transformer_units = [
-        projection_dim * 2,
-        projection_dim,
-    ]
-    # Size of the dense layers of the final classifier
-    mlp_head_units = [
-        mlp_first_head_units,
-        int(mlp_first_head_units/2),
-    ]
-
+def create_vit_model(input_shape, labels_number, patch_size=16, projection_dim=256, num_heads=8,
+                     transformer_layers=8, mlp_head_units=256, learning_rate=0.001):
     inputs = keras.Input(shape=input_shape)
 
-    augmented = data_augmentation_layers(inputs)
-    patches = Patches(patch_size)(augmented)
-    encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
-
-    for _ in range(transformer_layers):
-        # Layer normalization 1.
-        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-        # Create a multi-head attention layer.
-        attention_output = layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=projection_dim, dropout=0.1
-        )(x1, x1)
-        # Skip connection 1.
-        x2 = layers.Add()([attention_output, encoded_patches])
-        # Layer normalization 2.
-        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
-        # MLP.
-        x3 = mlp(x3, hidden_units=transformer_units, dropout_rate=0.1)
-        # Skip connection 2.
-        encoded_patches = layers.Add()([x3, x2])
-
-    # Create a [batch_size, projection_dim] tensor.
-    representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-    representation = layers.Flatten()(representation)
-    representation = layers.Dropout(0.5)(representation)
-
-    # Add MLP.
-    features = mlp(representation, hidden_units=mlp_head_units, dropout_rate=0.5)
-
-    # Classify outputs.
-    outputs = layers.Dense(num_classes, activation='softmax')(features)
-
-    model = keras.Model(inputs=inputs, outputs=outputs)
-
-    model.compile(
-        optimizer=AdamW(learning_rate=learning_rate),
-        loss=keras.losses.CategoricalCrossentropy(),
-        metrics=[
-            keras.metrics.CategoricalAccuracy(name="accuracy"),
-            # keras.metrics.TopKCategoricalAccuracy(5, name="top-5-accuracy"),
-        ],
-    )
-
-    return model
-
-
-def create_simplified_vit(input_shape, num_classes, patch_size=16, projection_dim=64, num_heads=4,
-                          transformer_layers=4, mlp_head_units=256, learning_rate=0.001):
-    inputs = keras.Input(shape=input_shape)
     inputs = data_augmentation_layers(inputs)
 
     # Create patches
@@ -216,53 +260,40 @@ def create_simplified_vit(input_shape, num_classes, patch_size=16, projection_di
     pos_embedding = layers.Embedding(input_dim=patch_dims, output_dim=projection_dim)(positions)
     patches += pos_embedding
 
-    # Create multiple layers of the Transformer block
     for _ in range(transformer_layers):
-        # Layer normalization 1
         x1 = layers.LayerNormalization(epsilon=1e-6)(patches)
-        # Multi-head attention
         attention_output = layers.MultiHeadAttention(
             num_heads=num_heads, key_dim=projection_dim // num_heads, dropout=0.1
         )(x1, x1)
-        # Skip connection 1
+        # Residual connections (via the Add layer) help preserve the original input to the layer.
+        # This helps maintain gradients during backpropagation, making training more effective.
         x2 = layers.Add()([attention_output, patches])
-        # Layer normalization 2
         x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
         # MLP
         x3 = layers.Dense(projection_dim * 2, activation="gelu")(x3)
         x3 = layers.Dense(projection_dim)(x3)
         x3 = layers.Dropout(0.1)(x3)
-        # Skip connection 2
         patches = layers.Add()([x3, x2])
 
-    # Create a [batch_size, projection_dim] tensor
+    # Representation layers
     representation = layers.LayerNormalization(epsilon=1e-6)(patches)
     representation = layers.GlobalAveragePooling1D()(representation)
 
     # Classify outputs
     features = layers.Dense(mlp_head_units, activation="gelu")(representation)
-    features = layers.Dropout(0.5)(features)
-    outputs = layers.Dense(num_classes, activation='softmax')(features)
+    features = layers.Dropout(0.3)(features)
+    outputs = layers.Dense(labels_number, activation='softmax')(features)
 
-    # Create the Keras model
     model = keras.Model(inputs=inputs, outputs=outputs)
 
-    model.compile(
-        optimizer=AdamW(learning_rate=learning_rate),
-        loss=keras.losses.CategoricalCrossentropy(),
-        metrics=[
-            keras.metrics.CategoricalAccuracy(name="accuracy"),
-            # keras.metrics.TopKCategoricalAccuracy(5, name="top-5-accuracy"),
-        ],
-    )
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss='categorical_crossentropy', metrics=['accuracy'])
 
     return model
 
+
 def get_results_of_model(model, dataset_train, dataset_val, dataset_test, model_name, epoch=1000, batch_size=32):
-    checkpoint_path = f"{MODELS_PATH}/checkpoint_{model_name}.keras"
-    checkpoint = ModelCheckpoint(checkpoint_path, monitor='val_loss', verbose=1, save_best_only=True, mode='min')
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=10, min_lr=1e-6)
-    es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=25)
+    rlp = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=1)
+    es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=15, restore_best_weights=True)
 
     fitting_start_time = time.time()
     history = model.fit(dataset_train,
@@ -270,19 +301,17 @@ def get_results_of_model(model, dataset_train, dataset_val, dataset_test, model_
                         batch_size=batch_size,
                         # epochs=2,
                         epochs=epoch,
-                        callbacks=[checkpoint, reduce_lr, es],
+                        callbacks=[rlp, es],
                         verbose=1)
     fitting_time = time.time() - fitting_start_time
 
-    model.load_weights(checkpoint_path)
-
     val_loss, val_accuracy = model.evaluate(dataset_val, verbose=False)
     print(f"\nValidation Accuracy:{val_accuracy}.")
-
     test_loss, test_accuracy = model.evaluate(dataset_test, verbose=False)
     print(f"\nTest Accuracy:{test_accuracy}.\n")
 
     plot_history(history, path=f"{RESULTS_PATH}/history_{model_name}.png")
+    # show_history(history)
 
     return {
         "fitting_time": fitting_time,
@@ -294,16 +323,16 @@ def get_results_of_model(model, dataset_train, dataset_val, dataset_test, model_
     }
 
 
-def display_results(results, hyperparameter_name):
+def display_results(results):
     results_df = DataFrame(results)
 
-    display_results_plot(results_df, hyperparameter_name, ["fitting_time"], "fitting_time")
-    display_results_plot(results_df, hyperparameter_name, ["test_accuracy", "val_accuracy"], "accuracies",
+    display_results_plot(results_df, ["fitting_time"], "fitting_time")
+    display_results_plot(results_df, ["test_accuracy", "val_accuracy"], "accuracies",
                          ascending=False)
-    display_results_plot(results_df, hyperparameter_name, ["test_loss", "val_loss"], "losses")
+    display_results_plot(results_df, ["test_loss", "val_loss"], "losses")
 
 
-def display_results_plot(results, hyperparameter_name, metrics, metrics_name, ascending=True):
+def display_results_plot(results, metrics, metrics_name, ascending=True):
     results.sort_values(metrics[0], ascending=ascending, inplace=True)
 
     performance_plot = (results[metrics + ["model_name"]].plot(kind="bar", x="model_name", figsize=(15, 8), rot=0,
@@ -313,17 +342,55 @@ def display_results_plot(results, hyperparameter_name, metrics, metrics_name, as
     plt.xticks(rotation=90)
     performance_plot.set(xlabel=None)
 
-    performance_plot.get_figure().savefig(f"{RESULTS_PATH}/{hyperparameter_name}_{metrics_name}_plot.png",
-                                          bbox_inches='tight')
+    performance_plot.get_figure().savefig(f"{RESULTS_PATH}/{metrics_name}_plot.png", bbox_inches='tight')
     # plt.show()
     plt.close()
 
 
-def mlp(x, hidden_units, dropout_rate):
-    for units in hidden_units:
-        x = layers.Dense(units, activation=keras.activations.gelu)(x)
-        x = layers.Dropout(dropout_rate)(x)
-    return x
+def load_images():
+    images_df = DataFrame()
+
+    all_images = list(glob.glob(f"{CROPPED_IMAGES_PATH}/*/*.jpg"))
+    images_df["image_path"] = all_images
+
+    images_df["label_name"] = images_df["image_path"].apply(lambda path: path.split("/")[-2].lower())
+
+    labels = [f.path.split("/")[-1].lower() for f in os.scandir(CROPPED_IMAGES_PATH) if f.is_dir()]
+    label_encoder = LabelEncoder()
+    label_encoder.fit(labels)
+    images_df["label"] = label_encoder.transform(images_df["label_name"])
+
+    return images_df
+
+
+def explain_images(model, model_name, random_row_ids_for_rise):
+    images_df = load_images()
+    explainer = RISE()
+
+    for index, row_id in enumerate(random_row_ids_for_rise):
+        row = images_df.iloc[row_id]
+
+        image = Image.open(row['image_path'])
+        image = np.array(image.resize((224, 224)))
+
+        heatmaps, masks = explainer.explain(image, model)
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+        ax1.imshow(image)
+        ax2.imshow(heatmaps[row['label']], cmap='jet')
+        ax2.imshow(image, alpha=0.5)
+
+        plt.axis('off')
+        fig.savefig(f"{RESULTS_PATH}/explanation_{model_name}_{index+1}.png", bbox_inches='tight')
+        # plt.show()
+        plt.close()
+
+
+def get_model(model_name, labels_number):
+    if model_name == "cnn":
+        return create_cnn_model(input_shape=image_size + (3,), labels_number=labels_number)
+    elif model_name == "vit":
+        return create_vit_model(input_shape=image_size + (3,), labels_number=labels_number)
 
 
 if __name__ == '__main__':
@@ -340,28 +407,26 @@ if __name__ == '__main__':
                               data_type='validation')
     dataset_test = get_dataset(CROPPED_IMAGES_PATH, image_size, batch_size, data_type=None)
 
+    random_row_ids_for_rise = [randint(0, len(dataset_test) - 1) for _ in range(4)]
+
     results = []
     for model_name in [
-        "simple",
+        "cnn",
         "vit",
-        # "vit_advanced"
     ]:
-        print(f"Starting training of {model_name} model.\n")
+        print(f"\nStarting training of {model_name} model.\n")
 
-        if model_name == "simple":
-            model = create_cnn_model(input_shape=image_size + (3,), labels_number=labels_number)
-        elif model_name == "vit":
-            model = create_simplified_vit(input_shape=image_size + (3,), num_classes=labels_number)
-        else:
-            model = create_vit_model(input_shape=image_size + (3,), num_classes=labels_number)
+        model = get_model(model_name, labels_number)
 
         result = get_results_of_model(model, dataset_train, dataset_val, dataset_test, model_name,
-                                      batch_size=batch_size)
+                                      batch_size=batch_size, epoch=100)
         results.append(result)
 
         model.save(f"{MODELS_PATH}/model_{model_name}.keras")
 
+        explain_images(model, model_name, random_row_ids_for_rise)
+
     sorted_results = sorted(results, key=lambda x: x["val_accuracy"], reverse=True)
-    display_results(sorted_results, "simple")
+    display_results(sorted_results)
 
     print("Custom models learning script finished.\n")
