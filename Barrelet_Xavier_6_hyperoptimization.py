@@ -15,20 +15,23 @@ from matplotlib import pyplot as plt
 from pandas import DataFrame
 
 IMAGES_PATH = "resources/Images"
-CROPPED_IMAGES_PATH = "resources/Cropped_Images2"
+CROPPED_IMAGES_PATH = "resources/cropped_Images_10_races"
 MODELS_PATH = "models/custom_model_hyperoptimization"
 MODEL_SAVE_PATH = f"{MODELS_PATH}/custom_model.keras"
-CHECKPOINT_SAVE_PATH = f"{MODELS_PATH}/checkpoint.keras"
 RESULTS_PATH = "results/custom_model_hyperoptimization"
 
 # To optimize GPU memory consumption
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-data_augmentation_layers = Sequential(
+
+data_augmentation_layers = keras.Sequential(
     [
-        layers.RandomFlip("horizontal"),
-        layers.RandomRotation(factor=0.02),
-        # layers.RandomZoom(height_factor=0.2, width_factor=0.2),
+        layers.RandomRotation(factor=0.15),
+        layers.RandomTranslation(height_factor=0.1, width_factor=0.1),
+        layers.RandomFlip(mode='horizontal'),
+        layers.RandomContrast(factor=0.1),
+        layers.RandomZoom(height_factor=(-0.2, 0.2), width_factor=(-0.2, 0.2)),
+        layers.RandomBrightness(factor=0.1)
     ],
     name="data_augmentation",
 )
@@ -77,132 +80,11 @@ def get_optimizer(optimizer, learning_rate):
             raise ValueError(f"Unknown optimizer:{optimizer}.")
 
 
-class Patches(layers.Layer):
-    def __init__(self, patch_size):
-        super().__init__()
-        self.patch_size = patch_size
 
-    def call(self, images):
-        input_shape = ops.shape(images)
-        batch_size = input_shape[0]
-        height = input_shape[1]
-        width = input_shape[2]
-        channels = input_shape[3]
-        num_patches_h = height // self.patch_size
-        num_patches_w = width // self.patch_size
-        patches = keras.ops.image.extract_patches(images, size=self.patch_size)
-        patches = ops.reshape(
-            patches,
-            (
-                batch_size,
-                num_patches_h * num_patches_w,
-                self.patch_size * self.patch_size * channels,
-            ),
-        )
-        return patches
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"patch_size": self.patch_size})
-        return config
-
-
-# The PatchEncoder layer will linearly transform a patch by projecting it into a vector of size projection_dim.
-# In addition, it adds a learnable position embedding to the projected vector.
-class PatchEncoder(layers.Layer):
-    def __init__(self, num_patches, projection_dim):
-        super().__init__()
-        self.num_patches = num_patches
-        self.projection = layers.Dense(units=projection_dim)
-        self.position_embedding = layers.Embedding(
-            input_dim=num_patches, output_dim=projection_dim
-        )
-
-    def call(self, patch):
-        positions = ops.expand_dims(
-            ops.arange(start=0, stop=self.num_patches, step=1), axis=0
-        )
-        projected_patches = self.projection(patch)
-        encoded = projected_patches + self.position_embedding(positions)
-        return encoded
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"num_patches": self.num_patches})
-        return config
-
-
-def mlp(x, hidden_units, dropout_rate):
-    for units in hidden_units:
-        x = layers.Dense(units, activation=keras.activations.gelu)(x)
-        x = layers.Dropout(dropout_rate)(x)
-    return x
-
-
-def create_vit_model(input_shape, num_classes, image_size=224, patch_size=4, projection_dim=64, num_heads=2,
-                     transformer_layers=4, mlp_first_head_units=2048, learning_rate=0.001):
-    num_patches = (image_size // patch_size) ** 2
-    # Size of the transformer layers
-    transformer_units = [
-        projection_dim * 2,
-        projection_dim,
-    ]
-    # Size of the dense layers of the final classifier
-    mlp_head_units = [
-        mlp_first_head_units,
-        int(mlp_first_head_units / 2),
-    ]
-
+def create_vit_model(input_shape, labels_number, patch_size=16, projection_dim=256, num_heads=8,
+                     transformer_layers=8, mlp_head_units=256, learning_rate=0.001, optimizer="adam"):
     inputs = keras.Input(shape=input_shape)
 
-    augmented = data_augmentation_layers(inputs)
-    patches = Patches(patch_size)(augmented)
-    encoded_patches = PatchEncoder(num_patches, projection_dim)(patches)
-
-    for _ in range(transformer_layers):
-        # Layer normalization 1.
-        x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-        # Create a multi-head attention layer.
-        attention_output = layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=projection_dim, dropout=0.1
-        )(x1, x1)
-        # Skip connection 1.
-        x2 = layers.Add()([attention_output, encoded_patches])
-        # Layer normalization 2.
-        x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
-        # MLP.
-        x3 = mlp(x3, hidden_units=transformer_units, dropout_rate=0.1)
-        # Skip connection 2.
-        encoded_patches = layers.Add()([x3, x2])
-
-    # Create a [batch_size, projection_dim] tensor.
-    representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
-    representation = layers.Flatten()(representation)
-    representation = layers.Dropout(0.5)(representation)
-
-    # Add MLP.
-    features = mlp(representation, hidden_units=mlp_head_units, dropout_rate=0.5)
-
-    # Classify outputs.
-    outputs = layers.Dense(num_classes, activation='softmax')(features)
-
-    model = keras.Model(inputs=inputs, outputs=outputs)
-
-    model.compile(
-        optimizer=AdamW(learning_rate=learning_rate),
-        loss=keras.losses.CategoricalCrossentropy(),
-        metrics=[
-            keras.metrics.CategoricalAccuracy(name="accuracy"),
-            # keras.metrics.TopKCategoricalAccuracy(5, name="top-5-accuracy"),
-        ],
-    )
-
-    return model
-
-
-def create_simplified_vit(input_shape, labels_number, patch_size=4, projection_dim=64, num_heads=2,
-                          transformer_layers=2, mlp_head_units=256, optimizer="adamw", learning_rate=0.001):
-    inputs = keras.Input(shape=input_shape)
     inputs = data_augmentation_layers(inputs)
 
     # Create patches
@@ -215,45 +97,34 @@ def create_simplified_vit(input_shape, labels_number, patch_size=4, projection_d
     pos_embedding = layers.Embedding(input_dim=patch_dims, output_dim=projection_dim)(positions)
     patches += pos_embedding
 
-    # Create multiple layers of the Transformer block
     for _ in range(transformer_layers):
-        # Layer normalization 1
         x1 = layers.LayerNormalization(epsilon=1e-6)(patches)
-        # Multi-head attention
         attention_output = layers.MultiHeadAttention(
             num_heads=num_heads, key_dim=projection_dim // num_heads, dropout=0.1
         )(x1, x1)
-        # Skip connection 1
+        # Residual connections (via the Add layer) help preserve the original input to the layer.
+        # This helps maintain gradients during backpropagation, making training more effective.
         x2 = layers.Add()([attention_output, patches])
-        # Layer normalization 2
         x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
         # MLP
         x3 = layers.Dense(projection_dim * 2, activation="gelu")(x3)
         x3 = layers.Dense(projection_dim)(x3)
         x3 = layers.Dropout(0.1)(x3)
-        # Skip connection 2
         patches = layers.Add()([x3, x2])
 
-    # Create a [batch_size, projection_dim] tensor
+    # Representation layers
     representation = layers.LayerNormalization(epsilon=1e-6)(patches)
     representation = layers.GlobalAveragePooling1D()(representation)
 
-    # MLP, classify outputs
+    # Classify outputs
     features = layers.Dense(mlp_head_units, activation="gelu")(representation)
-    features = layers.Dropout(0.5)(features)
+    features = layers.Dropout(0.3)(features)
     outputs = layers.Dense(labels_number, activation='softmax')(features)
 
-    # Create the Keras model
     model = keras.Model(inputs=inputs, outputs=outputs)
 
-    model.compile(
-        optimizer=get_optimizer(optimizer, learning_rate),
-        loss=keras.losses.CategoricalCrossentropy(),
-        metrics=[
-            keras.metrics.CategoricalAccuracy(name="accuracy"),
-            # keras.metrics.TopKCategoricalAccuracy(5, name="top-5-accuracy"),
-        ],
-    )
+    model.compile(optimizer=get_optimizer(optimizer, learning_rate), loss='categorical_crossentropy',
+                  metrics=['accuracy'])
 
     return model
 
@@ -284,11 +155,10 @@ def display_results_plot(results, hyperparameter_name, metrics, metrics_name, as
 
 
 def get_callbacks():
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=10, min_lr=1e-6)
-    checkpoint = ModelCheckpoint(CHECKPOINT_SAVE_PATH, monitor='val_loss', verbose=1, save_best_only=True, mode='min')
-    es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=25)
+    rlp = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=1)
+    es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=15, restore_best_weights=True)
 
-    return [checkpoint, es, reduce_lr]
+    return [es, rlp]
 
 
 def get_results_of_model(model, dataset_train, dataset_val, dataset_test, parameters, epoch=1000, batch_size=4):
@@ -333,7 +203,7 @@ if __name__ == '__main__':
 
     image_size = (224, 224)
     batch_size = 4
-    labels_number = 30
+    labels_number = 20
 
     dataset_train = get_dataset(CROPPED_IMAGES_PATH, image_size, batch_size, validation_split=0.2,
                                 data_type='training')
@@ -356,7 +226,7 @@ if __name__ == '__main__':
         {"name": "patch_size_25", "parameters": {"patch_size": 25}}
     ]:
         print(f"\nTesting now the parameters:{hyperparameters["parameters"]}.\n")
-        model = create_simplified_vit(input_shape=image_size + (3,), labels_number=labels_number,
+        model = create_vit_model(input_shape=image_size + (3,), labels_number=labels_number,
                                       **hyperparameters["parameters"])
 
         results.append(get_results_of_model(model, dataset_train, dataset_val, dataset_test,
@@ -376,7 +246,7 @@ if __name__ == '__main__':
         {"name": "num_heads_8", "parameters": {"num_heads": 8}}
     ]:
         print(f"Testing now the parameters:{hyperparameters["parameters"]}.\n")
-        model = create_simplified_vit(input_shape=image_size + (3,), labels_number=labels_number,
+        model = create_vit_model(input_shape=image_size + (3,), labels_number=labels_number,
                                       patch_size=best_layers_parameters["patch_size"],
                                       **hyperparameters["parameters"])
 
@@ -399,7 +269,7 @@ if __name__ == '__main__':
         {"name": "transformer_layers_8", "parameters": {"transformer_layers": 8}}
     ]:
         print(f"Testing now the parameters:{hyperparameters["parameters"]}.\n")
-        model = create_simplified_vit(input_shape=image_size + (3,), labels_number=labels_number,
+        model = create_vit_model(input_shape=image_size + (3,), labels_number=labels_number,
                                       patch_size=best_layers_parameters["patch_size"],
                                       num_heads=best_layers_parameters["num_heads"],
                                       **hyperparameters["parameters"])
@@ -421,7 +291,7 @@ if __name__ == '__main__':
         {"name": "mlp_head_units_1024", "parameters": {"mlp_head_units": 1024}}
     ]:
         print(f"Testing now the parameters:{hyperparameters["parameters"]}.\n")
-        model = create_simplified_vit(input_shape=image_size + (3,), labels_number=labels_number,
+        model = create_vit_model(input_shape=image_size + (3,), labels_number=labels_number,
                                       patch_size=best_layers_parameters["patch_size"],
                                       num_heads=best_layers_parameters["num_heads"],
                                       transformer_layers=best_layers_parameters["transformer_layers"],
@@ -445,7 +315,7 @@ if __name__ == '__main__':
         {"name": "projection_dim_256", "parameters": {"projection_dim": 256}}
     ]:
         print(f"Testing now the parameters:{hyperparameters["parameters"]}.\n")
-        model = create_simplified_vit(input_shape=image_size + (3,), labels_number=labels_number,
+        model = create_vit_model(input_shape=image_size + (3,), labels_number=labels_number,
                                       patch_size=best_layers_parameters["patch_size"],
                                       num_heads=best_layers_parameters["num_heads"],
                                       transformer_layers=best_layers_parameters["transformer_layers"],
@@ -470,7 +340,7 @@ if __name__ == '__main__':
         {"name": "sgd_nesterov_optimizer", "parameters": {"optimizer": "sgdn"}},
     ]:
         print(f"Testing now the parameters:{hyperparameters["parameters"]}.\n")
-        model = create_simplified_vit(input_shape=image_size + (3,), labels_number=labels_number,
+        model = create_vit_model(input_shape=image_size + (3,), labels_number=labels_number,
                                       patch_size=best_layers_parameters["patch_size"],
                                       projection_dim=best_layers_parameters["projection_dim"],
                                       num_heads=best_layers_parameters["num_heads"],

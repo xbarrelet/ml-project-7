@@ -21,7 +21,7 @@ from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 
 
-CROPPED_IMAGES_PATH = "resources/Cropped_Images"
+CROPPED_IMAGES_PATH = "resources/Cropped_Images2"
 MODELS_PATH = "models/custom_models"
 RESULTS_PATH = "results/custom_models"
 
@@ -93,7 +93,6 @@ class RISE:
             self,
             inp,
             model,
-            preprocessing_fn=None,
             masks_user=None,
             N=2000,
             s=8,
@@ -363,7 +362,7 @@ def load_images():
     return images_df
 
 
-def explain_images(model, model_name, random_row_ids_for_rise):
+def explain_images(model, model_name, random_row_ids_for_rise, image_size):
     images_df = load_images()
     explainer = RISE()
 
@@ -371,7 +370,7 @@ def explain_images(model, model_name, random_row_ids_for_rise):
         row = images_df.iloc[row_id]
 
         image = Image.open(row['image_path'])
-        image = np.array(image.resize((224, 224)))
+        image = np.array(image.resize(image_size))
 
         heatmaps, masks = explainer.explain(image, model)
 
@@ -397,9 +396,9 @@ if __name__ == '__main__':
     print("Starting custom models learning script.\n")
     remove_last_generated_models_and_results()
 
-    image_size = (224, 224)
-    batch_size = 32
-    labels_number = 120
+    image_size = (300, 300)
+    batch_size = 16
+    labels_number = 5
 
     dataset_train = get_dataset(CROPPED_IMAGES_PATH, image_size, batch_size, validation_split=0.2,
                                 data_type='training')
@@ -412,7 +411,7 @@ if __name__ == '__main__':
     results = []
     for model_name in [
         "cnn",
-        "vit",
+        "vit"
     ]:
         print(f"\nStarting training of {model_name} model.\n")
 
@@ -424,7 +423,7 @@ if __name__ == '__main__':
 
         model.save(f"{MODELS_PATH}/model_{model_name}.keras")
 
-        explain_images(model, model_name, random_row_ids_for_rise)
+        explain_images(model, model_name, random_row_ids_for_rise, image_size)
 
     sorted_results = sorted(results, key=lambda x: x["val_accuracy"], reverse=True)
     display_results(sorted_results)
