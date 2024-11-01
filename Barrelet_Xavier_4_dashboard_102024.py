@@ -2,6 +2,7 @@ import io
 
 import keras
 import numpy as np
+import plotly.io as pio
 import streamlit as st
 from PIL import Image
 from keras import Model
@@ -38,6 +39,9 @@ CACHED_RACES = {41: 'english_springer', 17: 'border_terrier', 33: 'collie', 52: 
 
 # CLOUD URL: https://project-7-dashboard.streamlit.app/
 
+# This dashboard code is just a copy paste of the actual Streamlit app
+# residing in its dedicated Github repo (https://github.com/xbarrelet/project-7-streamlit-dashboard).
+
 st.set_page_config(layout='wide', page_title="Dashboard de prédictions")
 st.title("Dashboard de prédictions")
 
@@ -46,15 +50,22 @@ st.write("Ce dashboard permet de tester la prédiction de la race de chien de l'
 with st.container():
     with st.expander("Exploration du jeu de données"):
         st.write("Voici le nombre d'images par race de chien avec leur moyenne:")
-        st.image("images/images_count_per_race.png", caption="Nombre d'images par race de chien")
 
-        st.write("Voici les dimensions des images:")
-        st.image("images/images_dimensions.png", caption="Dimensions des images")
+        with open(f"images/images_count_per_race.json", "r") as f:
+            images_count_per_label_html_plot = f.read()
+        st.plotly_chart(pio.from_json(images_count_per_label_html_plot), caption="Nombre d'images par race de chien")
+
+        st.write("Voici les dimensions des images (hauteur moyenne=301, largeur moyenne=284):")
+
+        with open(f"images/images_dimensions.json", "r") as f:
+            images_dimensions_json_plot = f.read()
+        st.plotly_chart(pio.from_json(images_dimensions_json_plot), caption="Dimensions des images")
 
         st.write('Voici quelques images du set de données originale puis après recadrement et redimensionnement.')
         st.image("images/example_1.png", caption="Premier exemple")
         st.image("images/example_2.png", caption="Deuxième exemple")
         st.image("images/example_3.png", caption="Troisième exemple")
+        st.image("images/example_4.png", caption="Quatrième exemple")
 
 model: Model = keras.models.load_model(MODEL_PATH, compile=False)
 
@@ -65,7 +76,7 @@ if img_file_buffer is not None:
 
     img = Image.open(io.BytesIO(bytes_data))
     img = img.convert('RGB')
-    img = img.resize((224, 224))
+    img = img.resize((300, 300))
     input_arr = keras.utils.img_to_array(img)
     image_batch = np.array([input_arr])
 

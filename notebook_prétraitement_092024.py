@@ -1,17 +1,20 @@
 import glob
 import os
-from os.path import exists
 from xml.etree import ElementTree
 
 import cv2
+import plotly.express as px
 from PIL import Image
 from matplotlib import pyplot as plt
 from pandas import DataFrame
 from sklearn.preprocessing import LabelEncoder
 
 IMAGES_PATH = "resources/Images"
-CROPPED_IMAGES_PATH = "resources/cropped_Images_10_races"
+CROPPED_IMAGES_PATH = "resources/Cropped_Images"
+# CROPPED_IMAGES_PATH = "resources/cropped_Images_10_races"
 MODELS_PATH = "models"
+PLOTLY_PATH = "results/plotly"
+
 
 
 def extract_information_from_annotations(image_path):
@@ -86,7 +89,7 @@ def print_images_dimensions(images_df):
 
 
 def resize_image(row):
-    return cv2.resize(row['image'], (224, 224))
+    return cv2.resize(row['image'], (300, 300))
 
 
 def convert_image_to_grayscale(row):
@@ -107,20 +110,49 @@ def display_images_count_per_label(images_df):
         counts.append({"label": label, "count": len(images_df[images_df['label_name'] == label])})
 
     counts_df = DataFrame(counts).sort_values("label")
-    counts_plot = (counts_df.plot(kind="bar", x="label", figsize=(15, 8), rot=0,
-                                  title=f"Count of images per label"))
-
     mean_count = sum(count['count'] for count in counts) / len(counts)
-    plt.axhline(y=mean_count, color='g', linestyle='-')
-    plt.yticks(list(plt.yticks()[0]) + [mean_count])
 
-    counts_plot.title.set_size(20)
-    counts_plot.set(xlabel=None)
-    plt.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
-    plt.gca().get_legend().remove()
+    fig = px.bar(counts_df, x='label', y='count', labels={'label': 'Race', 'count': 'Count'},
+                 hover_data={'label': True, 'count': True})
 
-    plt.show()
-    plt.close()
+    # counts_plot = (counts_df.plot(kind="bar", x="label", figsize=(15, 8), rot=0,
+    #                               title=f"Count of images per label"))
+
+    fig.add_hline(y=mean_count, line_dash="dash", line_color="green", annotation_text=f"Mean: {mean_count:.2f}")
+
+    fig.update_layout(xaxis_title=None, yaxis_title=None, showlegend=False)
+
+    os.makedirs(PLOTLY_PATH, exist_ok=True)
+    fig.write_json(f"{PLOTLY_PATH}/images_count_per_race.json")
+
+
+
+def plot_image_dimensions_distribution(images_df):
+    dimensions = []
+
+    for image_path in images_df[['image_path']].values:
+        image = Image.open(image_path[0])
+        width, height = image.size
+        dimensions.append({"width": width, "height": height})
+
+    dimensions_df = DataFrame(dimensions)
+    dimensions_df['index'] = dimensions_df.index
+
+    fig = px.line(dimensions_df, x='index', y=['width', 'height'],
+                  labels={'index': 'Image Index', 'value': 'Dimension Value'})
+
+    mean_width = dimensions_df["width"].mean()
+    mean_height = dimensions_df["height"].mean()
+
+    fig.add_hline(y=mean_width, line_dash="dash", line_color="blue", annotation_text=f"Mean Width: {mean_width:.2f}")
+    fig.add_hline(y=mean_height, line_dash="dash", line_color="orange",
+                  annotation_text=f"Mean Height: {mean_height:.2f}")
+
+    fig.update_layout(xaxis_title=None, yaxis_title=None, showlegend=True)
+
+    # Save the plot as an interactive HTML file
+    os.makedirs(PLOTLY_PATH, exist_ok=True)
+    fig.write_json(f"{PLOTLY_PATH}/images_dimensions.json")
 
 
 if __name__ == '__main__':
@@ -133,16 +165,18 @@ if __name__ == '__main__':
     print(f"{len(images_df)} images have been loaded with {len(images_df['label_name'].unique())} different labels.\n")
 
     print("Displaying now the count of images per label.\n")
-    display_images_count_per_label(images_df)
+    # display_images_count_per_label(images_df)
 
     print("Displaying now the dimensions of the images.\n")
-    print_images_dimensions(images_df)
+    # print_images_dimensions(images_df)
 
-    # images_df = images_df.head(5)
+    # plot_image_dimensions_distribution(images_df)
+
+    images_df = images_df.head(10)
 
     # print("Creating now resized images.\n")
     # # Resizing image to fit the 224x224 input size of most models
-    # images_df["resized_image"] = images_df.apply(resize_image, axis=1)
+    images_df["resized_image"] = images_df.apply(resize_image, axis=1)
     #
     # print("Creating now grayscaled images.\n")
     # # Conversion of the image to grayscale as color is not a relevant information in race detection
@@ -156,19 +190,39 @@ if __name__ == '__main__':
     # # Equalize the histogram of the image to improve the contrast and make the features more visible
     # images_df["equalized_image"] = images_df.apply(equalize_histogram, axis=1)
     #
-    # for image_index in range(1, len(images_df) + 1):
-    #     print(f"Displaying different states of image number:{image_index}.\n")
-    #     image = images_df.iloc[image_index]
-    #
-    #     f, ax = plt.subplots(2, 3, figsize=(9, 6))
-    #     ax[0, 0].imshow(image['image'])
-    #     ax[0, 1].imshow(image['resized_image'])
-    #     ax[0, 2].axis('off')
-    #     ax[1, 0].imshow(image['grayscaled_image'], cmap='gray', vmin=0, vmax=255)
-    #     ax[1, 1].imshow(image['denoised_image'], cmap='gray', vmin=0, vmax=255)
-    #     ax[1, 2].imshow(image['equalized_image'], cmap='gray', vmin=0, vmax=255)
-    #
-    #     plt.show()
-    #     plt.close()
+    for image_index in range(1, len(images_df) + 1):
+        print(f"Displaying different states of image number:{image_index}.\n")
+        image = images_df.iloc[image_index]
+
+        # Extract the filename from the image path
+        filename = os.path.basename(image['image_path'])
+
+        # Construct the path to the original image in the resources/Images folder
+        search_path = os.path.join(IMAGES_PATH, '**', filename)
+        original_image_paths = glob.glob(search_path, recursive=True)
+
+        if original_image_paths:
+            original_image_path = original_image_paths[0]
+        else:
+            print(f"Image {filename} not found in {IMAGES_PATH}.")
+            continue
+
+        # Open the original image
+        original_image = Image.open(original_image_path)
+
+        resized_image_rgb = cv2.cvtColor(image['resized_image'], cv2.COLOR_BGR2RGB)
+
+        f, ax = plt.subplots(1, 2, figsize=(9, 6))
+        # f, ax = plt.subplots(2, 3, figsize=(9, 6))
+        # ax[0].imshow(image['image'])
+        ax[0].imshow(original_image)
+        ax[1].imshow(resized_image_rgb)
+        # ax[0, 2].axis('off')
+        # ax[1, 0].imshow(image['grayscaled_image'], cmap='gray', vmin=0, vmax=255)
+        # ax[1, 1].imshow(image['denoised_image'], cmap='gray', vmin=0, vmax=255)
+        # ax[1, 2].imshow(image['equalized_image'], cmap='gray', vmin=0, vmax=255)
+
+        plt.show()
+        plt.close()
 
     print("Analysis and preprocessing script finished.\n")
